@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
 """
-Combo (chord) support for layout optimization.
+Thumb-combo (chord) support for layout optimization.
 
-A "combo" is two or more keys pressed simultaneously to produce one letter.
+Model: a "thumb-combo" is the same single key X pressed simultaneously with a
+dedicated thumb modifier key. It produces a different letter than bare X but
+its physical typing characteristics (hand, finger, row, key-preference) are
+identical to bare X — only an extra activation cost is incurred for engaging
+the thumb modifier.
+
 This module provides:
   - A hand/finger/row map for the standard 32-key QWERTY layout.
-  - Adjacency rules used to generate plausible combos.
-  - Helpers to enumerate combo slots and to parse slot IDs.
+  - `generate_combos`, which produces one thumb-combo slot per single key.
+  - Helpers to build/parse slot IDs.
 
 Slot ID format:
-  - Single-key slot: the bare key char, e.g. "F".
-  - Combo slot:      bracketed concatenation of constituent chars in canonical
-                     (sorted-by-QWERTY-position) order, e.g. "[DF]", "[SDF]".
+  - Bare single-key slot:    "F"
+  - Thumb-modified slot:     "[F]"
+  In both cases the constituent tuple is ('F',). The bracket on the slot ID
+  is the discriminator that the scorer uses to apply the thumb-combo penalty.
 """
 
-from itertools import combinations
 from typing import Dict, List, Tuple
 
 # Canonical QWERTY 32-key order (matches keyboards/layouts_filter_patterns.py)
@@ -39,19 +44,8 @@ QWERTY_FINGER_MAP: Dict[str, Tuple[str, int, int]] = {
 }
 
 
-def _qwerty_rank(ch: str) -> int:
-    """Stable ordering of single-key chars by QWERTY position (for canonical combo IDs)."""
-    try:
-        return QWERTY_ORDER.index(ch)
-    except ValueError:
-        return len(QWERTY_ORDER) + ord(ch)
-
-
 def is_adjacent_same_hand(p1: str, p2: str) -> bool:
-    """
-    Two single-key positions are 'adjacent same-hand' iff they share a hand and
-    their fingers are the same or differ by 1 (i.e. neighbouring fingers).
-    """
+    """Retained for backwards compatibility; no longer used by `generate_combos`."""
     if p1 == p2:
         return False
     info1 = QWERTY_FINGER_MAP.get(p1.upper())
@@ -65,51 +59,33 @@ def is_adjacent_same_hand(p1: str, p2: str) -> bool:
     return abs(f1 - f2) <= 1
 
 
-def _all_pairwise_adjacent(group: Tuple[str, ...]) -> bool:
-    """Return True if every pair in `group` is adjacent same-hand."""
-    for a, b in combinations(group, 2):
-        if not is_adjacent_same_hand(a, b):
-            return False
-    return True
-
-
-def generate_combos(positions: List[str], max_size: int = 2) -> List[Tuple[str, ...]]:
+def generate_combos(positions: List[str]) -> List[Tuple[str, ...]]:
     """
-    Enumerate all unique combo groups of size 2..max_size from `positions`.
+    Generate one thumb-combo slot per single key in `positions`.
 
-    No adjacency or same-hand restriction is imposed — every C(N, k) unique
-    combination is produced. Awkward combos (e.g. cross-hand or same-finger)
-    are expected to be discouraged by `combo_same_finger_penalty` and the
-    underlying position-pair scoring tables rather than filtered out here.
-
-    Args:
-        positions: list of single-key position chars
-        max_size: maximum combo size (>=2)
+    A thumb-combo is the same key X plus a dedicated thumb modifier; its
+    typing characteristics (hand/finger/row/key-preference) are identical to
+    bare X. The combo activation cost is captured by `combo_penalty` in the
+    scorer, applied per thumb-combo slot involved in a bigram or trigram.
 
     Returns:
-        List of tuples, each tuple in canonical (QWERTY-rank) order.
-        Duplicates removed.
+        List of size-1 tuples, e.g. ('F',), ('J',), ... — one per input
+        position. Build the slot ID with `combo_id(('F',))` -> '[F]'.
     """
-    if max_size < 2:
-        return []
-
     upper_positions = [p.upper() for p in positions]
-    combos_out: List[Tuple[str, ...]] = []
     seen = set()
-
-    for size in range(2, max_size + 1):
-        for group in combinations(upper_positions, size):
-            canonical = tuple(sorted(group, key=_qwerty_rank))
-            if canonical in seen:
-                continue
-            seen.add(canonical)
-            combos_out.append(canonical)
-
-    return combos_out
+    out: List[Tuple[str, ...]] = []
+    for p in upper_positions:
+        t = (p,)
+        if t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+    return out
 
 
 def combo_id(constituents: Tuple[str, ...]) -> str:
-    """Return the bracketed slot ID, e.g. ('D','F') -> '[DF]'."""
+    """Return the bracketed slot ID, e.g. ('F',) -> '[F]'."""
     return '[' + ''.join(constituents) + ']'
 
 
@@ -118,7 +94,7 @@ def parse_slot(slot_id: str) -> Tuple[str, ...]:
     Parse a slot ID into its constituent single-key chars.
 
     'F'    -> ('F',)
-    '[DF]' -> ('D', 'F')
+    '[F]'  -> ('F',)
     """
     s = slot_id.strip()
     if s.startswith('[') and s.endswith(']'):
@@ -127,15 +103,14 @@ def parse_slot(slot_id: str) -> Tuple[str, ...]:
 
 
 def is_combo(slot_id: str) -> bool:
-    """True if slot_id is a combo (bracketed)."""
+    """True if slot_id is a thumb-combo (bracketed)."""
     return slot_id.startswith('[') and slot_id.endswith(']')
 
 
 def count_same_finger_pairs(constituents: Tuple[str, ...]) -> int:
     """
-    Count how many unordered constituent pairs share the same (hand, finger).
-    A 2-key combo on the same finger returns 1; a 3-key combo where all three
-    share a finger returns 3 (C(3,2)=3); none-shared returns 0.
+    Retained for backwards compatibility. With size-1 thumb-combos this
+    always returns 0 (no in-slot pairs).
     """
     n = len(constituents)
     if n < 2:
@@ -156,10 +131,9 @@ def count_same_finger_pairs(constituents: Tuple[str, ...]) -> int:
 
 def count_cross_same_finger_pairs(consts_a: Tuple[str, ...], consts_b: Tuple[str, ...]) -> int:
     """
-    Count how many cross-slot constituent pairs (one from consts_a, one from
-    consts_b) share the same (hand, finger), excluding pairs where the two
-    constituents are the SAME key (a == b). Used to detect "combo SFBs":
-    bigram transitions in/out of a combo where the moving finger is the same.
+    Retained for backwards compatibility. With size-1 thumb-combos the
+    scorer skips single-vs-single (already encoded in engram_same_finger
+    table), so this returns 0 in that path.
     """
     count = 0
     for a in consts_a:
@@ -180,8 +154,8 @@ def count_cross_same_finger_pairs(consts_a: Tuple[str, ...], consts_b: Tuple[str
 if __name__ == "__main__":
     # Quick sanity demo
     test_positions = list("ASDFJKL;")
-    print(f"Adjacency demo for {test_positions}:")
-    pairs = generate_combos(test_positions, max_size=2)
-    for c in pairs:
+    combos = generate_combos(test_positions)
+    print(f"Thumb-combo slots for {test_positions}:")
+    for c in combos:
         print(f"  {combo_id(c)}  ({c})")
-    print(f"Total: {len(pairs)} adjacent same-hand pairs")
+    print(f"Total: {len(combos)} thumb-combo slots (one per single key)")

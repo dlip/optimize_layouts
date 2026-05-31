@@ -46,22 +46,23 @@ optimization:
   positions_to_assign:     "ASDFJKL;EI"
   positions_to_constrain:  "DFJK"
 
-  # Combo (chord) support
-  # When enable_combos is true, additional "combo slots" are auto-generated
-  # from adjacent same-hand pairs of `positions_to_assign`. Each combo is
-  # treated as one extra position; its score on each objective is the SUM of
-  # the constituent single-key position-pair scores. Combos of size > 2 are
-  # multiplied by combo_penalty^(size - 2) to discourage large chords.
-  # Each in-combo constituent pair that uses the SAME finger multiplies the
-  # score by combo_same_finger_penalty (heavy penalty for awkward chords).
+  # Thumb-combo (chord) support
+  # When enable_combos is true, one extra "thumb-combo slot" is auto-generated
+  # for every key in `positions_to_assign`. A thumb-combo slot is the same
+  # bare key pressed simultaneously with a dedicated thumb modifier, and is
+  # written as "[X]" in output. It uses the same finger/row/hand as the bare
+  # key X (so all per-finger / per-row / key-preference scoring matches the
+  # bare key); a flat activation cost `combo_penalty` is multiplied per
+  # thumb-combo slot involved in a bigram. So a bigram between two thumb-combo
+  # slots pays the penalty twice (combo_penalty^2).
+  # `max_combo_size` and `combo_same_finger_penalty` are retained for legacy
+  # multi-key combo support but are no-ops for size-1 thumb-combos.
   #
-  # Example for a 26-letter layout on 16 single keys + auto-combos:
+  # Example for a 26-letter layout on 16 single keys + thumb-combos:
   #   items_to_assign:     "etaoinsrhldcumfpgwybvkxjqz"   # 26 letters
   #   positions_to_assign: "ASDFJKL;ZXCVNM,."             # 16 single keys (2/finger)
   #   enable_combos:       true
-  #   max_combo_size:      2
   #   combo_penalty:       0.5
-  #   combo_same_finger_penalty: 0.3
   enable_combos:             false
   max_combo_size:            2
   combo_penalty:             0.5

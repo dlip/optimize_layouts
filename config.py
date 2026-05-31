@@ -80,12 +80,16 @@ class OptimizationConfig:
 
     @property
     def combo_slots(self) -> List[str]:
-        """Auto-generated combo slot IDs (bracketed) when combos are enabled."""
+        """Auto-generated thumb-combo slot IDs (bracketed) when combos are enabled.
+
+        One thumb-combo slot per key in `positions_to_assign`. Each slot
+        represents that key pressed together with a dedicated thumb modifier.
+        """
         if not self.enable_combos:
             return []
         # Lazy import to avoid circular import at module load time.
         from combos import generate_combos, combo_id
-        return [combo_id(c) for c in generate_combos(list(self.positions_to_assign), self.max_combo_size)]
+        return [combo_id(c) for c in generate_combos(list(self.positions_to_assign))]
 
     
 @dataclass
@@ -267,12 +271,10 @@ def validate_config(config: Config) -> None:
     total_items = len(opt.items_to_assign) + len(opt.items_assigned)
     total_positions = len(opt.positions_to_assign) + len(opt.positions_assigned)
 
-    # When combos are enabled, count combo slots toward available positions.
+    # When combos are enabled, count thumb-combo slots toward available positions.
     if opt.enable_combos:
         n_combo_slots = len(opt.combo_slots)
         total_positions += n_combo_slots
-        if n_combo_slots == 0:
-            print("Warning: enable_combos is true but no adjacent same-hand combos could be generated from positions_to_assign")
 
     if total_items > total_positions:
         raise ValueError(

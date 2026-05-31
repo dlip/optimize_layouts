@@ -1,4 +1,8 @@
-# 1-minute run: 26 letters on 16 single keys + auto-generated 2-key combos.
+# 26-letter alphabet on 16 single keys (top + home rows, 2/finger) + 16 thumb-combo slots (32 total).
+# Each thumb-combo "[X]" is the bare key X pressed simultaneously with a
+# dedicated thumb modifier. It uses the same finger/row/hand as X; the only
+# difference is a flat activation cost (combo_penalty) per combo slot
+# involved in a bigram.
 paths:
   item_pair_score_table:        "input/frequency/english-letter-pair-counts-google-ngrams_normalized.csv"
   position_pair_score_table:    "input/engram_2key_scores.csv"
@@ -24,12 +28,12 @@ optimization:
   items_to_assign:         "etaoinsrhldcumfpgwybvkxjqz"   # 26 letters
   items_to_constrain:      ""
   positions_assigned:      ""
-  positions_to_assign:     "ASDFJKL;ZXCVNM,."             # 16 single keys (2/finger)
+  positions_to_assign:     "QWERASDFUIOPJKL;"             # 16 single keys: top + home rows, 2/finger
   positions_to_constrain:  ""
   enable_combos:             true
-  max_combo_size:            2
-  combo_penalty:             0.5
-  combo_same_finger_penalty: 0.3
+  max_combo_size:            1                            # ignored — thumb-combos are always size-1
+  combo_penalty:             0.5                          # multiplier per thumb-combo slot in a bigram
+  combo_same_finger_penalty: 1.0                          # unused for size-1 thumb-combos
 
 visualization:
   print_keyboard: True

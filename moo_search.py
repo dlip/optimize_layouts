@@ -166,11 +166,10 @@ class MOOUpperBoundCalculator:
         self.scorer = scorer
         self._cache = {}
 
-        # When combos are present, a single slot can contribute up to
-        # max_combo_size constituent positions, so a slot-pair lookup can sum
-        # up to max_combo_size^2 raw position-pair scores. We inflate the
-        # per-objective max accordingly to keep upper bounds valid.
-        self.combo_inflation = max(1, getattr(scorer, 'max_combo_size', 1)) ** 2
+        # Every slot in the current thumb-combo model has size-1 constituents,
+        # so a slot-pair lookup contributes at most one raw position-pair score
+        # — no inflation needed for the bound to remain valid.
+        self.combo_inflation = 1
 
         # Pre-calculate TRUE maximum values (not heuristics)
         self.true_max_position_scores = self._calculate_true_max_position_scores()

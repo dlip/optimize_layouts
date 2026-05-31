@@ -85,20 +85,25 @@ class WeightedMOOScorer:
         self.max_combo_size = max_combo_size
         self.combo_same_finger_penalty = combo_same_finger_penalty
 
-        # Pre-parse each slot into its constituent single-key chars, e.g. 'F' -> ('F',), '[DF]' -> ('D','F')
+        # Pre-parse each slot into its constituent single-key chars, e.g. 'F' -> ('F',), '[F]' -> ('F',)
         self.position_constituents: List[Tuple[str, ...]] = [
             tuple(c.upper() for c in parse_slot(p)) for p in self.positions
+        ]
+        # Identify thumb-combo slots by their bracketed slot ID. The bare key
+        # 'F' and the thumb-combo '[F]' have identical constituent tuples; the
+        # bracket is the only discriminator that triggers the activation penalty.
+        self.position_is_combo: List[bool] = [
+            p.startswith('[') and p.endswith(']') for p in self.positions
         ]
         # Pre-compute the number of same-finger constituent pairs per slot (0 for single keys)
         self.position_same_finger_pairs: List[int] = [
             count_same_finger_pairs(c) for c in self.position_constituents
         ]
         # Pre-compute cross-slot same-finger constituent pair counts. Used to
-        # penalise "combo SFBs": a bigram transition between slot i and slot j
-        # where some constituent of i and some (different) constituent of j
-        # share a finger. Only applied when at least one of the two slots is a
-        # combo, otherwise single-key SFBs would be double-counted (they are
-        # already encoded in the engram_same_finger table).
+        # penalise "combo SFBs" between multi-key constituent slots. With the
+        # current thumb-combo model every slot has size-1 constituents, so
+        # this matrix is all zeros — the code path is retained for any future
+        # multi-key combo extensions.
         n_pos_init = len(self.positions)
         self._cross_sf_pairs = np.zeros((n_pos_init, n_pos_init), dtype=np.int32)
         for i in range(n_pos_init):
@@ -339,16 +344,18 @@ class WeightedMOOScorer:
     def _pair_score(self, slot_i_idx: int, slot_j_idx: int,
                     position_pair_scores: Dict[str, float]) -> float:
         """
-        Score the position-pair contribution for two slots, summing over all
-        constituent single-key pairs. Combos of size > 2 are penalised by
-        combo_penalty^(max_size - 2). Same-finger constituent pairs are
-        penalised by combo_same_finger_penalty^count, including:
-          - in-slot SFBs (constituents within the same combo on the same finger)
-          - cross-slot SFBs (a bigram transition between two slots where some
-            constituent of one and some (different) constituent of the other
-            share a finger). Cross-slot SFBs are only counted when at least
-            one of the two slots is a combo, since single-vs-single SFBs are
-            already encoded in the engram_same_finger position-pair table.
+        Score the position-pair contribution for two slots.
+
+        For thumb-combo slots (bracketed slot IDs), the constituent tuple is
+        the same as the bare key (size-1), so the underlying pair score is
+        identical to the bare-key bigram. A flat activation penalty
+        (combo_penalty) is multiplied per thumb-combo slot involved in the
+        pair, so a bigram between two thumb-combo slots pays the penalty
+        twice (combo_penalty^2).
+
+        For multi-key combo slots (legacy/future support), the constituent
+        sum-over-pairs is computed, large-combo penalty (max_size > 2) and
+        same-finger constituent pair penalties are also applied.
         """
         consts_i = self.position_constituents[slot_i_idx]
         consts_j = self.position_constituents[slot_j_idx]
@@ -360,6 +367,10 @@ class WeightedMOOScorer:
         max_size = max(len(consts_i), len(consts_j))
         if max_size > 2:
             raw *= self.combo_penalty ** (max_size - 2)
+        # Thumb-combo activation penalty: applied per combo slot in the pair.
+        n_combo = int(self.position_is_combo[slot_i_idx]) + int(self.position_is_combo[slot_j_idx])
+        if n_combo > 0:
+            raw *= self.combo_penalty ** n_combo
         sf_pairs = (
             self.position_same_finger_pairs[slot_i_idx]
             + self.position_same_finger_pairs[slot_j_idx]
@@ -372,11 +383,9 @@ class WeightedMOOScorer:
     def _triple_score(self, slot_i_idx: int, slot_j_idx: int, slot_k_idx: int,
                       position_triple_scores: Dict[str, float]) -> float:
         """
-        Score the position-triple contribution for three slots, summing over
-        all constituent single-key triples. Combos of size > 2 in any slot are
-        penalised by combo_penalty^(max_size - 2). Same-finger constituent
-        pairs (in-slot and cross-slot, when a combo is involved) are penalised
-        by combo_same_finger_penalty^count.
+        Score the position-triple contribution for three slots. Thumb-combo
+        activation penalty (combo_penalty) is multiplied once per thumb-combo
+        slot involved in the triple. See `_pair_score` for full semantics.
         """
         consts_i = self.position_constituents[slot_i_idx]
         consts_j = self.position_constituents[slot_j_idx]
@@ -393,6 +402,12 @@ class WeightedMOOScorer:
         max_size = max(len(consts_i), len(consts_j), len(consts_k))
         if max_size > 2:
             raw *= self.combo_penalty ** (max_size - 2)
+        # Thumb-combo activation penalty: applied per combo slot in the triple.
+        n_combo = (int(self.position_is_combo[slot_i_idx])
+                   + int(self.position_is_combo[slot_j_idx])
+                   + int(self.position_is_combo[slot_k_idx]))
+        if n_combo > 0:
+            raw *= self.combo_penalty ** n_combo
         sf_pairs = (
             self.position_same_finger_pairs[slot_i_idx]
             + self.position_same_finger_pairs[slot_j_idx]
