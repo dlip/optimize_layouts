@@ -37,7 +37,13 @@ class OptimizationConfig:
     # Constraints (subset restrictions)
     items_to_constrain: str = ""
     positions_to_constrain: str = ""
-    
+
+    # Combo (chord) support
+    enable_combos: bool = False
+    max_combo_size: int = 2
+    combo_penalty: float = 0.5
+    combo_same_finger_penalty: float = 0.5
+
     def __post_init__(self):
         """Normalize strings to proper case."""
         self.items_to_assign = self.items_to_assign.lower()
@@ -71,6 +77,15 @@ class OptimizationConfig:
     @property
     def positions_to_constrain_set(self) -> Set[str]:
         return set(self.positions_to_constrain) if self.positions_to_constrain else set()
+
+    @property
+    def combo_slots(self) -> List[str]:
+        """Auto-generated combo slot IDs (bracketed) when combos are enabled."""
+        if not self.enable_combos:
+            return []
+        # Lazy import to avoid circular import at module load time.
+        from combos import generate_combos, combo_id
+        return [combo_id(c) for c in generate_combos(list(self.positions_to_assign), self.max_combo_size)]
 
     
 @dataclass
@@ -251,17 +266,29 @@ def validate_config(config: Config) -> None:
     # Check sufficient positions for items
     total_items = len(opt.items_to_assign) + len(opt.items_assigned)
     total_positions = len(opt.positions_to_assign) + len(opt.positions_assigned)
-    
+
+    # When combos are enabled, count combo slots toward available positions.
+    if opt.enable_combos:
+        n_combo_slots = len(opt.combo_slots)
+        total_positions += n_combo_slots
+        if n_combo_slots == 0:
+            print("Warning: enable_combos is true but no adjacent same-hand combos could be generated from positions_to_assign")
+
     if total_items > total_positions:
         raise ValueError(
             f"Insufficient positions: need {total_items} total positions "
             f"but only have {total_positions} available"
         )
-    
-    if len(opt.items_to_assign) > len(opt.positions_to_assign):
+
+    if not opt.enable_combos and len(opt.items_to_assign) > len(opt.positions_to_assign):
         raise ValueError(
             f"More items to assign ({len(opt.items_to_assign)}) "
             f"than available positions ({len(opt.positions_to_assign)})"
+        )
+    elif opt.enable_combos and len(opt.items_to_assign) > (len(opt.positions_to_assign) + len(opt.combo_slots)):
+        raise ValueError(
+            f"More items to assign ({len(opt.items_to_assign)}) "
+            f"than available positions+combos ({len(opt.positions_to_assign) + len(opt.combo_slots)})"
         )
     
     # Validate constraints are subsets of items/positions to assign

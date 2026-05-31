@@ -171,7 +171,9 @@ def validate_inputs(config: Config, objectives: List[str], position_pair_score_t
     opt = config.optimization
     n_items = len(opt.items_to_assign)
     n_positions = len(opt.positions_to_assign)
-    
+    if opt.enable_combos:
+        n_positions += len(opt.combo_slots)
+
     if n_items > n_positions:
         raise ValueError(f"More items ({n_items}) than positions ({n_positions})")
     if n_items < 2:
@@ -216,7 +218,13 @@ def save_moo_results(pareto_front: List[Dict], config: Config, objectives: List[
         expected_order = items_assigned + items_to_assign  # etao + insrhldcum = etaoinsrhldcum
 
         items_str = ''.join(expected_order)
-        positions_str = ''.join(mapping[item] for item in expected_order)
+        # If any slot is a combo (bracketed multi-char), use comma separator so
+        # combo slot IDs remain unambiguous in the output CSV.
+        slot_strs = [mapping[item] for item in expected_order]
+        if any(s.startswith('[') for s in slot_strs):
+            positions_str = ','.join(slot_strs)
+        else:
+            positions_str = ''.join(slot_strs)
         layout_display = f"{items_str} -> {positions_str}"
         
         # Build result row with configuration metadata
@@ -314,10 +322,13 @@ def run_moo_optimization(config: Config, objectives: List[str], position_pair_sc
     items_to_assign = list(opt.items_to_assign) if opt.items_to_assign else []
     positions_assigned = list(opt.positions_assigned) if opt.positions_assigned else []
     positions_to_assign = list(opt.positions_to_assign) if opt.positions_to_assign else []
-    
-    # Combine to create the full problem space
+
+    # Auto-generate combo slot IDs (bracketed) when combos are enabled.
+    combo_slot_ids = list(opt.combo_slots) if opt.enable_combos else []
+
+    # Combine to create the full problem space (single keys + combo slots)
     all_items = items_assigned + items_to_assign
-    all_positions = positions_assigned + positions_to_assign
+    all_positions = positions_assigned + positions_to_assign + combo_slot_ids
     
     if verbose:
         print(f"\nCombining problem space:")
@@ -326,6 +337,8 @@ def run_moo_optimization(config: Config, objectives: List[str], position_pair_sc
         print(f"  -> Complete item set: {all_items}")
         print(f"  Pre-assigned positions: {positions_assigned}")
         print(f"  Positions available: {positions_to_assign}")
+        if combo_slot_ids:
+            print(f"  Auto-generated combo slots ({len(combo_slot_ids)}): {combo_slot_ids}")
         print(f"  -> Complete position set: {all_positions}")
     
     # Use the combined sets for the scorer (this is what was missing!)
@@ -340,12 +353,15 @@ def run_moo_optimization(config: Config, objectives: List[str], position_pair_sc
         objectives=objectives,
         position_pair_score_table=position_pair_score_table,
         items=items,           # Now includes pre-assigned + to-be-optimized
-        positions=positions,   # Now includes pre-assigned + available
+        positions=positions,   # Now includes pre-assigned + available + combos
         weights=weights,
         maximize=maximize,
         item_pair_score_table=item_pair_score_table,
         position_triple_score_table=position_triple_score_table,
         item_triple_score_table=item_triple_score_table,
+        combo_penalty=opt.combo_penalty,
+        max_combo_size=opt.max_combo_size,
+        combo_same_finger_penalty=opt.combo_same_finger_penalty,
         verbose=verbose
     )    
     if verbose:

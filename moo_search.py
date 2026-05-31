@@ -165,7 +165,13 @@ class MOOUpperBoundCalculator:
     def __init__(self, scorer):
         self.scorer = scorer
         self._cache = {}
-        
+
+        # When combos are present, a single slot can contribute up to
+        # max_combo_size constituent positions, so a slot-pair lookup can sum
+        # up to max_combo_size^2 raw position-pair scores. We inflate the
+        # per-objective max accordingly to keep upper bounds valid.
+        self.combo_inflation = max(1, getattr(scorer, 'max_combo_size', 1)) ** 2
+
         # Pre-calculate TRUE maximum values (not heuristics)
         self.true_max_position_scores = self._calculate_true_max_position_scores()
         self.true_max_item_weights = self._calculate_true_max_item_weights()
@@ -177,10 +183,12 @@ class MOOUpperBoundCalculator:
         for obj_name in self.scorer.objectives:
             if obj_name in self.scorer.trigram_objectives:
                 position_scores = self.scorer.position_triple_scores.get(obj_name, {})
-                max_scores[obj_name] = max(position_scores.values()) if position_scores else 1.0
+                base_max = max(position_scores.values()) if position_scores else 1.0
+                max_scores[obj_name] = base_max * self.combo_inflation
             else:
                 position_scores = self.scorer.position_pair_scores.get(obj_name, {})
-                max_scores[obj_name] = max(position_scores.values()) if position_scores else 1.0
+                base_max = max(position_scores.values()) if position_scores else 1.0
+                max_scores[obj_name] = base_max * self.combo_inflation
                 
         return max_scores
     
@@ -216,7 +224,10 @@ class MOOUpperBoundCalculator:
         
         if unassigned_count == 0:
             # Complete assignment - return exact score
-            bound_vector = self.scorer.score_layout(partial_mapping)
+            if hasattr(self.scorer, 'score_layout_fast'):
+                bound_vector = self.scorer.score_layout_fast(partial_mapping)
+            else:
+                bound_vector = self.scorer.score_layout(partial_mapping)
         elif unassigned_count == 1:
             # Special case: exactly compute best possible completion
             bound_vector = self._calculate_exact_one_item_bound(partial_mapping, used_positions)
@@ -248,7 +259,10 @@ class MOOUpperBoundCalculator:
             test_mapping[unassigned_item] = pos_idx
             
             # Get exact score for this complete assignment
-            scores = self.scorer.score_layout(test_mapping)
+            if hasattr(self.scorer, 'score_layout_fast'):
+                scores = self.scorer.score_layout_fast(test_mapping)
+            else:
+                scores = self.scorer.score_layout(test_mapping)
             
             # Track maximum for each objective
             for i, score in enumerate(scores):
@@ -344,50 +358,78 @@ class MOOUpperBoundCalculator:
         return weighted_bound
     
     def _calculate_current_bigram_score(self, partial_mapping: np.ndarray, obj_name: str) -> Tuple[float, float]:
-        """Calculate current bigram score and weight from partial assignment."""
-        position_pair_scores = self.scorer.position_pair_scores[obj_name]
-        
-        # Get assigned items and positions
+        """Calculate current bigram score and weight from partial assignment (combo-aware, vectorised)."""
+        scorer = self.scorer
+
+        # Use precomputed slot-pair score matrix when available (fast path).
+        slot_pair_score = getattr(scorer, '_slot_pair_score', None)
+        bigram_obj_indices = getattr(scorer, '_bigram_obj_indices', None)
+        if slot_pair_score is not None and bigram_obj_indices is not None and obj_name in scorer.bigram_objectives:
+            # Find this objective's index within the precomputed bigram axis.
+            obj_idx_full = scorer.objectives.index(obj_name)
+            try:
+                k = bigram_obj_indices.index(obj_idx_full)
+            except ValueError:
+                k = -1
+            if k >= 0:
+                placed_item_idx = np.where(partial_mapping >= 0)[0]
+                if placed_item_idx.size < 2:
+                    return 0.0, 0.0
+                slot_idx = partial_mapping[placed_item_idx].astype(np.int64)
+                sub = slot_pair_score[k, slot_idx[:, None], slot_idx[None, :]]
+                if scorer.use_bigram_weighting and scorer._item_pair_weight is not None:
+                    w = scorer._item_pair_weight[placed_item_idx[:, None], placed_item_idx[None, :]]
+                    mask = (w > 0) & (sub != 0.0)
+                    weighted_total = float((sub * w * mask).sum())
+                    weight_total = float((w * mask).sum())
+                    return weighted_total, weight_total
+                else:
+                    mask = (sub != 0.0)
+                    total_score = float((sub * mask).sum())
+                    pair_count = float(mask.sum())
+                    return total_score, pair_count
+
+        # Fallback: original Python loop (handles edge cases / trigram-only configs).
+        position_pair_scores = scorer.position_pair_scores[obj_name]
+
         assigned_items = []
-        assigned_positions = []
-        
+        assigned_slot_indices = []
         for i, pos_idx in enumerate(partial_mapping):
             if pos_idx >= 0:
-                assigned_items.append(self.scorer.items[i])
-                assigned_positions.append(self.scorer.positions[pos_idx])
-        
+                assigned_items.append(scorer.items[i])
+                assigned_slot_indices.append(int(pos_idx))
+
         if len(assigned_items) < 2:
             return 0.0, 0.0
-        
-        if self.scorer.use_bigram_weighting:
+
+        if scorer.use_bigram_weighting:
             weighted_total = 0.0
             weight_total = 0.0
-            
             for i in range(len(assigned_items)):
                 for j in range(len(assigned_items)):
                     if i != j:
                         letter_pair = assigned_items[i] + assigned_items[j]
-                        key_pair = assigned_positions[i] + assigned_positions[j]
-                        
-                        item_weight = self.scorer.item_pair_scores.get(letter_pair, 0.0)
-                        if item_weight > 0 and key_pair in position_pair_scores:
-                            score = position_pair_scores[key_pair]
-                            weighted_total += score * item_weight
-                            weight_total += item_weight
-            
+                        item_weight = scorer.item_pair_scores.get(letter_pair, 0.0)
+                        if item_weight > 0:
+                            score = scorer._pair_score(
+                                assigned_slot_indices[i], assigned_slot_indices[j], position_pair_scores
+                            )
+                            if score != 0.0:
+                                weighted_total += score * item_weight
+                                weight_total += item_weight
             return weighted_total, weight_total
         else:
             total_score = 0.0
             pair_count = 0
-            
             for i in range(len(assigned_items)):
                 for j in range(len(assigned_items)):
                     if i != j:
-                        key_pair = assigned_positions[i] + assigned_positions[j]
-                        if key_pair in position_pair_scores:
-                            total_score += position_pair_scores[key_pair]
+                        score = scorer._pair_score(
+                            assigned_slot_indices[i], assigned_slot_indices[j], position_pair_scores
+                        )
+                        if score != 0.0:
+                            total_score += score
                             pair_count += 1
-            
             return total_score, pair_count
     
     def clear_cache(self):
@@ -424,7 +466,11 @@ def branch_bound_moo_search(config: Config, scorer, max_solutions: Optional[int]
     # Get pre-assignment info
     items_assigned = list(opt.items_assigned) if opt.items_assigned else []
     positions_assigned = list(opt.positions_assigned) if opt.positions_assigned else []
-    
+
+    # Append auto-generated combo slots to the available positions when enabled.
+    combo_slot_ids: List[str] = list(opt.combo_slots) if opt.enable_combos else []
+    positions_available = positions_available + combo_slot_ids
+
     # Create FULL item and position lists (matching scorer's view)
     all_items = items_assigned + items_to_optimize
     all_positions = positions_assigned + positions_available
@@ -447,11 +493,14 @@ def branch_bound_moo_search(config: Config, scorer, max_solutions: Optional[int]
     if len(constrained_items) > 0:
         print(f"  Constrained items: {[all_items[i] for i in constrained_items]}")
         print(f"  Constraint positions: {[all_positions[i] for i in constrained_positions]}")
-    
+
+    if combo_slot_ids:
+        print(f"  Auto-generated combo slots ({len(combo_slot_ids)}): {combo_slot_ids}")
+
     # Initialize search state with FULL mapping array
     initial_mapping = np.full(n_items_total, -1, dtype=np.int16)
     initial_used = np.zeros(n_positions_total, dtype=bool)
-    
+
     # Pre-fill preassigned items in mapping
     if items_assigned and positions_assigned:
         print(f"  Pre-assigned: {items_assigned} -> {positions_assigned}")
@@ -460,10 +509,10 @@ def branch_bound_moo_search(config: Config, scorer, max_solutions: Optional[int]
             pos_idx = all_positions.index(pos.upper())
             initial_mapping[item_idx] = pos_idx
             initial_used[pos_idx] = True
-    
+
     # Initialize upper bound calculator
     bound_calc = MOOUpperBoundCalculator(scorer)
-    
+
     # Calculate search space size for progress estimation
     if len(constrained_items) > 0:
         # Two-phase constraint handling
@@ -665,7 +714,11 @@ def exhaustive_moo_search(config: Config, scorer, search_mode: str, max_solution
     # Get pre-assignment info
     items_assigned = list(opt.items_assigned) if opt.items_assigned else []
     positions_assigned = list(opt.positions_assigned) if opt.positions_assigned else []
-    
+
+    # Append auto-generated combo slots when enabled.
+    combo_slot_ids: List[str] = list(opt.combo_slots) if opt.enable_combos else []
+    positions_available = positions_available + combo_slot_ids
+
     # Create FULL item and position lists (matching scorer's view)
     all_items = items_assigned + items_to_optimize
     all_positions = positions_assigned + positions_available
@@ -688,7 +741,10 @@ def exhaustive_moo_search(config: Config, scorer, search_mode: str, max_solution
     if len(constrained_items) > 0:
         print(f"  Constrained items: {[all_items[i] for i in constrained_items]}")
         print(f"  Constraint positions: {[all_positions[i] for i in constrained_positions]}")
-    
+
+    if combo_slot_ids:
+        print(f"  Auto-generated combo slots ({len(combo_slot_ids)}): {combo_slot_ids}")
+
     # Initialize search state with FULL mapping array
     initial_mapping = np.full(n_items_total, -1, dtype=np.int16)
     initial_used = np.zeros(n_positions_total, dtype=bool)

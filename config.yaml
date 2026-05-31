@@ -44,7 +44,28 @@ optimization:
   items_to_constrain:      "ea"          # "et"   
   positions_assigned:      ""
   positions_to_assign:     "ASDFJKL;EI"
-  positions_to_constrain:  "DFJK"  
+  positions_to_constrain:  "DFJK"
+
+  # Combo (chord) support
+  # When enable_combos is true, additional "combo slots" are auto-generated
+  # from adjacent same-hand pairs of `positions_to_assign`. Each combo is
+  # treated as one extra position; its score on each objective is the SUM of
+  # the constituent single-key position-pair scores. Combos of size > 2 are
+  # multiplied by combo_penalty^(size - 2) to discourage large chords.
+  # Each in-combo constituent pair that uses the SAME finger multiplies the
+  # score by combo_same_finger_penalty (heavy penalty for awkward chords).
+  #
+  # Example for a 26-letter layout on 16 single keys + auto-combos:
+  #   items_to_assign:     "etaoinsrhldcumfpgwybvkxjqz"   # 26 letters
+  #   positions_to_assign: "ASDFJKL;ZXCVNM,."             # 16 single keys (2/finger)
+  #   enable_combos:       true
+  #   max_combo_size:      2
+  #   combo_penalty:       0.5
+  #   combo_same_finger_penalty: 0.3
+  enable_combos:             false
+  max_combo_size:            2
+  combo_penalty:             0.5
+  combo_same_finger_penalty: 0.5
 
 #-----------------------------------------------------------------------
 # Visualization settings

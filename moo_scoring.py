@@ -28,6 +28,8 @@ from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 from dataclasses import dataclass
 
+from combos import parse_slot, count_same_finger_pairs, count_cross_same_finger_pairs
+
 
 @dataclass
 class ScoringArrays:
@@ -53,6 +55,9 @@ class WeightedMOOScorer:
                  item_pair_score_table: str = "input/normalized-english-letter-pair-counts-google-ngrams.csv",
                  position_triple_score_table: Optional[str] = None,
                  item_triple_score_table: Optional[str] = None,
+                 combo_penalty: float = 0.5,
+                 max_combo_size: int = 2,
+                 combo_same_finger_penalty: float = 0.5,
                  verbose: bool = False):
         """
         Initialize weighted MOO scorer with bigram and trigram support.
@@ -67,12 +72,46 @@ class WeightedMOOScorer:
             item_pair_score_table: Path to English bigram frequencies
             position_triple_score_table: Path to CSV with trigram position scores
             item_triple_score_table: Path to English trigram frequencies
+            combo_penalty: Multiplier applied as combo_penalty^(slot_size - 2) when scoring slots whose size > 2.
+            max_combo_size: Maximum number of constituent keys for any combo slot.
         """
         self.objectives = objectives
         self.items = [item.upper() for item in items]
-        self.positions = [pos.upper() for pos in positions]
+        # Positions may include combo slot IDs (bracketed); preserve them as-is.
+        self.positions = [pos.upper() if not (pos.startswith('[') and pos.endswith(']')) else pos.upper() for pos in positions]
         self.objective_weights = weights or [1.0] * len(objectives)
         self.objective_maximize = maximize or [True] * len(objectives)
+        self.combo_penalty = combo_penalty
+        self.max_combo_size = max_combo_size
+        self.combo_same_finger_penalty = combo_same_finger_penalty
+
+        # Pre-parse each slot into its constituent single-key chars, e.g. 'F' -> ('F',), '[DF]' -> ('D','F')
+        self.position_constituents: List[Tuple[str, ...]] = [
+            tuple(c.upper() for c in parse_slot(p)) for p in self.positions
+        ]
+        # Pre-compute the number of same-finger constituent pairs per slot (0 for single keys)
+        self.position_same_finger_pairs: List[int] = [
+            count_same_finger_pairs(c) for c in self.position_constituents
+        ]
+        # Pre-compute cross-slot same-finger constituent pair counts. Used to
+        # penalise "combo SFBs": a bigram transition between slot i and slot j
+        # where some constituent of i and some (different) constituent of j
+        # share a finger. Only applied when at least one of the two slots is a
+        # combo, otherwise single-key SFBs would be double-counted (they are
+        # already encoded in the engram_same_finger table).
+        n_pos_init = len(self.positions)
+        self._cross_sf_pairs = np.zeros((n_pos_init, n_pos_init), dtype=np.int32)
+        for i in range(n_pos_init):
+            ci = self.position_constituents[i]
+            for j in range(n_pos_init):
+                if i == j:
+                    continue
+                # Skip single-vs-single: the position-pair table already handles it.
+                if len(ci) == 1 and len(self.position_constituents[j]) == 1:
+                    continue
+                self._cross_sf_pairs[i, j] = count_cross_same_finger_pairs(
+                    ci, self.position_constituents[j]
+                )
         
         # Validate inputs
         if len(self.objective_weights) != len(objectives):
@@ -129,6 +168,43 @@ class WeightedMOOScorer:
             item_pair_matrix=np.ones((n_items, n_items), dtype=np.float32),
             position_matrix=np.ones((n_positions, n_positions), dtype=np.float32)
         )
+
+        # Precompute slot-pair score matrices for fast scoring path.
+        # slot_pair_score[obj_idx, i, j] = penalised raw _pair_score for slots (i, j).
+        self._bigram_obj_indices: List[int] = [
+            i for i, obj in enumerate(self.objectives) if obj in self.bigram_objectives
+        ]
+        self._trigram_obj_indices: List[int] = [
+            i for i, obj in enumerate(self.objectives) if obj in self.trigram_objectives
+        ]
+
+        if self._bigram_obj_indices:
+            self._slot_pair_score = np.zeros(
+                (len(self._bigram_obj_indices), n_positions, n_positions), dtype=np.float64
+            )
+            for k, obj_idx in enumerate(self._bigram_obj_indices):
+                obj = self.objectives[obj_idx]
+                ps = self.position_pair_scores[obj]
+                for i in range(n_positions):
+                    for j in range(n_positions):
+                        if i == j:
+                            continue
+                        self._slot_pair_score[k, i, j] = self._pair_score(i, j, ps)
+        else:
+            self._slot_pair_score = None
+
+        # Precompute item-pair weight matrix indexed by item indices.
+        if self.use_bigram_weighting:
+            self._item_pair_weight = np.zeros((n_items, n_items), dtype=np.float64)
+            for i in range(n_items):
+                for j in range(n_items):
+                    if i == j:
+                        continue
+                    self._item_pair_weight[i, j] = self.item_pair_scores.get(
+                        self.items[i] + self.items[j], 0.0
+                    )
+        else:
+            self._item_pair_weight = None
 
     def _load_position_pair_scores(self, position_pair_score_table: str) -> Dict[str, Dict[str, float]]:
         """Load position-pair scores for bigram objectives from CSV table."""
@@ -260,6 +336,123 @@ class WeightedMOOScorer:
                 return col
         return None
     
+    def _pair_score(self, slot_i_idx: int, slot_j_idx: int,
+                    position_pair_scores: Dict[str, float]) -> float:
+        """
+        Score the position-pair contribution for two slots, summing over all
+        constituent single-key pairs. Combos of size > 2 are penalised by
+        combo_penalty^(max_size - 2). Same-finger constituent pairs are
+        penalised by combo_same_finger_penalty^count, including:
+          - in-slot SFBs (constituents within the same combo on the same finger)
+          - cross-slot SFBs (a bigram transition between two slots where some
+            constituent of one and some (different) constituent of the other
+            share a finger). Cross-slot SFBs are only counted when at least
+            one of the two slots is a combo, since single-vs-single SFBs are
+            already encoded in the engram_same_finger position-pair table.
+        """
+        consts_i = self.position_constituents[slot_i_idx]
+        consts_j = self.position_constituents[slot_j_idx]
+        raw = 0.0
+        for a in consts_i:
+            for b in consts_j:
+                if a != b:
+                    raw += position_pair_scores.get((a + b).upper(), 0.0)
+        max_size = max(len(consts_i), len(consts_j))
+        if max_size > 2:
+            raw *= self.combo_penalty ** (max_size - 2)
+        sf_pairs = (
+            self.position_same_finger_pairs[slot_i_idx]
+            + self.position_same_finger_pairs[slot_j_idx]
+            + int(self._cross_sf_pairs[slot_i_idx, slot_j_idx])
+        )
+        if sf_pairs > 0:
+            raw *= self.combo_same_finger_penalty ** sf_pairs
+        return raw
+
+    def _triple_score(self, slot_i_idx: int, slot_j_idx: int, slot_k_idx: int,
+                      position_triple_scores: Dict[str, float]) -> float:
+        """
+        Score the position-triple contribution for three slots, summing over
+        all constituent single-key triples. Combos of size > 2 in any slot are
+        penalised by combo_penalty^(max_size - 2). Same-finger constituent
+        pairs (in-slot and cross-slot, when a combo is involved) are penalised
+        by combo_same_finger_penalty^count.
+        """
+        consts_i = self.position_constituents[slot_i_idx]
+        consts_j = self.position_constituents[slot_j_idx]
+        consts_k = self.position_constituents[slot_k_idx]
+        raw = 0.0
+        for a in consts_i:
+            for b in consts_j:
+                if a == b:
+                    continue
+                for c in consts_k:
+                    if c == a or c == b:
+                        continue
+                    raw += position_triple_scores.get((a + b + c).upper(), 0.0)
+        max_size = max(len(consts_i), len(consts_j), len(consts_k))
+        if max_size > 2:
+            raw *= self.combo_penalty ** (max_size - 2)
+        sf_pairs = (
+            self.position_same_finger_pairs[slot_i_idx]
+            + self.position_same_finger_pairs[slot_j_idx]
+            + self.position_same_finger_pairs[slot_k_idx]
+            + int(self._cross_sf_pairs[slot_i_idx, slot_j_idx])
+            + int(self._cross_sf_pairs[slot_j_idx, slot_k_idx])
+            + int(self._cross_sf_pairs[slot_i_idx, slot_k_idx])
+        )
+        if sf_pairs > 0:
+            raw *= self.combo_same_finger_penalty ** sf_pairs
+        return raw
+
+    def score_layout_fast(self, mapping: np.ndarray) -> List[float]:
+        """
+        Vectorised scoring path used in the inner search loop.
+
+        Equivalent to score_layout() for bigram objectives but uses precomputed
+        slot-pair score matrices for an O(k^2) numpy reduction instead of an
+        O(k^2) Python loop with per-pair constituent expansion.
+        Falls back to score_layout() if any trigram objectives are configured.
+        """
+        # Trigram objectives are rare here; reuse the (slower but correct) path.
+        if self._trigram_obj_indices:
+            return self.score_layout(mapping)
+
+        if self._slot_pair_score is None:
+            return self.score_layout(mapping)
+
+        # Indices of items currently placed and the slot indices they occupy.
+        placed_item_idx = np.where(mapping >= 0)[0]
+        if placed_item_idx.size < 2:
+            return [0.0] * len(self.objectives)
+
+        slot_idx = mapping[placed_item_idx].astype(np.int64)
+
+        # slot_pair[a, b] = score for (slot at placed_item_idx[a], slot at placed_item_idx[b])
+        # Shape: (n_obj_bigram, k, k)
+        sub = self._slot_pair_score[:, slot_idx[:, None], slot_idx[None, :]]
+
+        if self.use_bigram_weighting and self._item_pair_weight is not None:
+            w = self._item_pair_weight[placed_item_idx[:, None], placed_item_idx[None, :]]
+            mask = (w > 0) & (sub != 0.0)
+            weighted = sub * w
+            num = (weighted * mask).sum(axis=(1, 2))
+            denom_each = (w * mask).sum(axis=(1, 2))
+            with np.errstate(divide='ignore', invalid='ignore'):
+                obj_scores = np.where(denom_each > 0, num / denom_each, 0.0)
+        else:
+            mask = (sub != 0.0)
+            num = (sub * mask).sum(axis=(1, 2))
+            denom = mask.sum(axis=(1, 2))
+            with np.errstate(divide='ignore', invalid='ignore'):
+                obj_scores = np.where(denom > 0, num / denom, 0.0)
+
+        # Map per-bigram-objective scores back into full objective vector.
+        result = [0.0] * len(self.objectives)
+        for k, obj_idx in enumerate(self._bigram_obj_indices):
+            result[obj_idx] = float(obj_scores[k])
+        return result
+
     def score_layout(self, mapping: np.ndarray, return_components: bool = False) -> List[float]:
         """
         Score layout for all objectives using appropriate bigram/trigram scoring.
@@ -296,14 +489,14 @@ class WeightedMOOScorer:
         """Score layout for single bigram objective."""
         position_pair_scores = self.position_pair_scores[objective]
         
-        # Get currently placed items and their positions
+        # Get currently placed items and the slot indices they occupy.
         placed_items = []
-        placed_positions = []
+        placed_slot_indices = []
         
         for i, pos_idx in enumerate(mapping):
             if pos_idx >= 0:
                 placed_items.append(self.items[i])
-                placed_positions.append(self.positions[pos_idx])
+                placed_slot_indices.append(int(pos_idx))
         
         if len(placed_items) < 2:
             return 0.0
@@ -311,23 +504,23 @@ class WeightedMOOScorer:
         # Calculate score using bigram logic
         if self.use_bigram_weighting:
             return self._calculate_bigram_weighted_score(
-                placed_items, placed_positions, position_pair_scores)
+                placed_items, placed_slot_indices, position_pair_scores)
         else:
             return self._calculate_bigram_unweighted_score(
-                placed_items, placed_positions, position_pair_scores)
+                placed_items, placed_slot_indices, position_pair_scores)
 
     def _score_single_trigram_objective(self, mapping: np.ndarray, objective: str) -> float:
         """Score layout for single trigram objective."""
         position_triple_scores = self.position_triple_scores[objective]
         
-        # Get currently placed items and their positions
+        # Get currently placed items and the slot indices they occupy.
         placed_items = []
-        placed_positions = []
+        placed_slot_indices = []
         
         for i, pos_idx in enumerate(mapping):
             if pos_idx >= 0:
                 placed_items.append(self.items[i])
-                placed_positions.append(self.positions[pos_idx])
+                placed_slot_indices.append(int(pos_idx))
         
         if len(placed_items) < 3:
             return 0.0
@@ -335,14 +528,14 @@ class WeightedMOOScorer:
         # Calculate score using trigram logic
         if self.use_trigram_weighting:
             return self._calculate_trigram_weighted_score(
-                placed_items, placed_positions, position_triple_scores)
+                placed_items, placed_slot_indices, position_triple_scores)
         else:
             return self._calculate_trigram_unweighted_score(
-                placed_items, placed_positions, position_triple_scores)
+                placed_items, placed_slot_indices, position_triple_scores)
     
-    def _calculate_bigram_weighted_score(self, items: List[str], positions: List[str], 
+    def _calculate_bigram_weighted_score(self, items: List[str], slot_indices: List[int], 
                                         position_pair_scores: Dict[str, float]) -> float:
-        """Calculate score using item-pair score weighting."""
+        """Calculate score using item-pair score weighting (combo-aware)."""
         weighted_total = 0.0
         item_pair_score_total = 0.0
         
@@ -350,66 +543,66 @@ class WeightedMOOScorer:
             for j in range(len(items)):
                 if i != j:
                     letter_pair = items[i] + items[j]
-                    key_pair = positions[i] + positions[j]
-                    
                     item_pair_score = self.item_pair_scores.get(letter_pair, 0.0)
-                    if item_pair_score > 0 and key_pair in position_pair_scores:
-                        score = position_pair_scores[key_pair]
-                        weighted_total += score * item_pair_score
-                        item_pair_score_total += item_pair_score
+                    if item_pair_score > 0:
+                        score = self._pair_score(slot_indices[i], slot_indices[j], position_pair_scores)
+                        if score != 0.0:
+                            weighted_total += score * item_pair_score
+                            item_pair_score_total += item_pair_score
         
         return weighted_total / item_pair_score_total if item_pair_score_total > 0 else 0.0
     
-    def _calculate_bigram_unweighted_score(self, items: List[str], positions: List[str],
+    def _calculate_bigram_unweighted_score(self, items: List[str], slot_indices: List[int],
                                           position_pair_scores: Dict[str, float]) -> float:
-        """Calculate score without item_pair_score weighting."""
+        """Calculate score without item_pair_score weighting (combo-aware)."""
         total_score = 0.0
         pair_count = 0
         
         for i in range(len(items)):
             for j in range(len(items)):
                 if i != j:
-                    key_pair = positions[i] + positions[j]
-                    if key_pair in position_pair_scores:
-                        total_score += position_pair_scores[key_pair]
+                    score = self._pair_score(slot_indices[i], slot_indices[j], position_pair_scores)
+                    if score != 0.0:
+                        total_score += score
                         pair_count += 1
         
         return total_score / pair_count if pair_count > 0 else 0.0
 
-    def _calculate_trigram_weighted_score(self, items: List[str], positions: List[str], 
+    def _calculate_trigram_weighted_score(self, items: List[str], slot_indices: List[int], 
                                          position_triple_scores: Dict[str, float]) -> float:
-        """Calculate trigram score using item-triple score weighting."""
+        """Calculate trigram score using item-triple score weighting (combo-aware)."""
         weighted_total = 0.0
         item_triple_score_total = 0.0
         
-        for i in range(len(items)):
-            for j in range(len(items)):
-                for k in range(len(items)):
-                    if i != j and j != k and i != k:  # All different
+        n = len(items)
+        for i in range(n):
+            for j in range(n):
+                for k in range(n):
+                    if i != j and j != k and i != k:
                         letter_triple = items[i] + items[j] + items[k]
-                        position_triple = positions[i] + positions[j] + positions[k]
-                        
                         item_triple_score = self.item_triple_scores.get(letter_triple, 0.0)
-                        if item_triple_score > 0 and position_triple in position_triple_scores:
-                            score = position_triple_scores[position_triple]
-                            weighted_total += score * item_triple_score
-                            item_triple_score_total += item_triple_score
+                        if item_triple_score > 0:
+                            score = self._triple_score(slot_indices[i], slot_indices[j], slot_indices[k], position_triple_scores)
+                            if score != 0.0:
+                                weighted_total += score * item_triple_score
+                                item_triple_score_total += item_triple_score
         
         return weighted_total / item_triple_score_total if item_triple_score_total > 0 else 0.0
 
-    def _calculate_trigram_unweighted_score(self, items: List[str], positions: List[str],
+    def _calculate_trigram_unweighted_score(self, items: List[str], slot_indices: List[int],
                                            position_triple_scores: Dict[str, float]) -> float:
-        """Calculate trigram score without item_triple_score weighting."""
+        """Calculate trigram score without item_triple_score weighting (combo-aware)."""
         total_score = 0.0
         triple_count = 0
         
-        for i in range(len(items)):
-            for j in range(len(items)):
-                for k in range(len(items)):
-                    if i != j and j != k and i != k:  # All different
-                        position_triple = positions[i] + positions[j] + positions[k]
-                        if position_triple in position_triple_scores:
-                            total_score += position_triple_scores[position_triple]
+        n = len(items)
+        for i in range(n):
+            for j in range(n):
+                for k in range(n):
+                    if i != j and j != k and i != k:
+                        score = self._triple_score(slot_indices[i], slot_indices[j], slot_indices[k], position_triple_scores)
+                        if score != 0.0:
+                            total_score += score
                             triple_count += 1
         
         return total_score / triple_count if triple_count > 0 else 0.0
