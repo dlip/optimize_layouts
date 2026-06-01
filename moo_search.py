@@ -499,7 +499,10 @@ def branch_bound_moo_search(config: Config, scorer, max_solutions: Optional[int]
     
     # Backtracking DFS: mutate a single mapping/used buffer and undo on return.
     # Avoids per-child np.copy() that previously dominated allocation cost.
-    constrained_set = set(int(x) for x in constrained_items)
+    # Precompute boolean mask: avoids O(k) `in` test on constrained_items per node.
+    is_constrained_item = np.zeros(n_items_total, dtype=bool)
+    for ci in constrained_items:
+        is_constrained_item[ci] = True
     terminate = [False]  # mutable flag for early termination across recursion
 
     def dfs_search_with_pruning(mapping: np.ndarray, used: np.ndarray, depth: int, pbar: Optional[tqdm]):
@@ -576,7 +579,7 @@ def branch_bound_moo_search(config: Config, scorer, max_solutions: Optional[int]
             return
 
         # Get valid positions for this item
-        if int(next_item) in constrained_set:
+        if is_constrained_item[next_item]:
             valid_positions = [pos for pos in constrained_positions if not used[pos]]
         else:
             valid_positions = [pos for pos in range(n_positions_total) if not used[pos]]
@@ -727,7 +730,9 @@ def exhaustive_moo_search(config: Config, scorer, search_mode: str, max_solution
     start_time = time.time()
     
     # Backtracking DFS: mutate a single mapping/used buffer and undo on return.
-    constrained_set = set(int(x) for x in constrained_items)
+    is_constrained_item = np.zeros(n_items_total, dtype=bool)
+    for ci in constrained_items:
+        is_constrained_item[ci] = True
     terminate = [False]
 
     def dfs_search_exhaustive(mapping: np.ndarray, used: np.ndarray, depth: int, pbar: Optional[tqdm]):
@@ -793,7 +798,7 @@ def exhaustive_moo_search(config: Config, scorer, search_mode: str, max_solution
             return
 
         # Get valid positions for this item
-        if int(next_item) in constrained_set:
+        if is_constrained_item[next_item]:
             valid_positions = [pos for pos in constrained_positions if not used[pos]]
         else:
             valid_positions = [pos for pos in range(n_positions_total) if not used[pos]]
