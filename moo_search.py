@@ -47,6 +47,16 @@ sys.setrecursionlimit(10000)
 # is O(n) per leaf when on.
 DEBUG_BOUNDS = os.environ.get("OPTIMIZE_LAYOUTS_DEBUG_BOUNDS", "0") == "1"
 
+# OPTIMIZE_LAYOUTS_EPSILON (float, default 0.0) trims the Pareto front using
+# additive ε-dominance: A ε-dominates B iff A_i + ε >= B_i for all i and the
+# inequality is strict (beyond ε) for at least one i. With ε=0 this reduces to
+# classical Pareto dominance. Larger ε aggressively collapses near-duplicates,
+# trading some front diversity for much smaller fronts and faster pruning.
+try:
+    EPSILON_DOMINANCE = float(os.environ.get("OPTIMIZE_LAYOUTS_EPSILON", "0.0"))
+except ValueError:
+    EPSILON_DOMINANCE = 0.0
+
 
 @jit(nopython=True)
 def get_next_item_jit(mapping: np.ndarray, constrained_items: np.ndarray) -> int:
@@ -141,6 +151,19 @@ def _dominates_arr(a: np.ndarray, b: np.ndarray) -> bool:
 
 
 @jit(nopython=True, cache=True)
+def _eps_dominates_arr(a: np.ndarray, b: np.ndarray, eps: float) -> bool:
+    """JIT'd additive ε-dominance: a ε-dominates b iff a_i + eps >= b_i for all
+    i, and a_i > b_i + eps for at least one i."""
+    at_least_one_strictly_better = False
+    for i in range(a.shape[0]):
+        if a[i] + eps < b[i]:
+            return False
+        if a[i] > b[i] + eps:
+            at_least_one_strictly_better = True
+    return at_least_one_strictly_better
+
+
+@jit(nopython=True, cache=True)
 def _front_dominates_any(front: np.ndarray, n_rows: int, candidate: np.ndarray) -> bool:
     """True if any of the first `n_rows` rows of `front` dominates `candidate`."""
     for r in range(n_rows):
@@ -172,15 +195,30 @@ def update_pareto_front(pareto_front: List[Dict], new_solution: Dict) -> List[Di
     new_objectives = new_solution['objectives']
     new_arr = np.asarray(new_objectives, dtype=np.float64)
 
+    eps = EPSILON_DOMINANCE
+    use_eps = eps > 0.0
+
     # Check if new solution is dominated by any existing solution
     for existing in pareto_front:
-        if _dominates_arr(np.asarray(existing['objectives'], dtype=np.float64), new_arr):
-            return pareto_front  # New solution is dominated
+        existing_arr = np.asarray(existing['objectives'], dtype=np.float64)
+        dominated = (
+            _eps_dominates_arr(existing_arr, new_arr, eps)
+            if use_eps
+            else _dominates_arr(existing_arr, new_arr)
+        )
+        if dominated:
+            return pareto_front  # New solution is (ε-)dominated
 
     # Remove any existing solutions dominated by the new solution
     updated_front = []
     for existing in pareto_front:
-        if not _dominates_arr(new_arr, np.asarray(existing['objectives'], dtype=np.float64)):
+        existing_arr = np.asarray(existing['objectives'], dtype=np.float64)
+        dominates_existing = (
+            _eps_dominates_arr(new_arr, existing_arr, eps)
+            if use_eps
+            else _dominates_arr(new_arr, existing_arr)
+        )
+        if not dominates_existing:
             updated_front.append(existing)
 
     # Add the new solution
