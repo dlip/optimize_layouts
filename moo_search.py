@@ -333,6 +333,7 @@ class MOOUpperBoundCalculator:
         
         # Get current partial score from assigned items
         assigned_items = [i for i in range(len(partial_mapping)) if partial_mapping[i] >= 0]
+        unassigned_idxs = [i for i in range(len(partial_mapping)) if partial_mapping[i] < 0]
         
         if len(assigned_items) >= 2:
             current_score, current_weight = self._calculate_current_bigram_score(partial_mapping, obj_name)
@@ -341,22 +342,36 @@ class MOOUpperBoundCalculator:
         
         # Calculate maximum possible contribution from remaining items
         max_pos_score = self.true_max_position_scores[obj_name]
-        max_item_weight = self.true_max_item_weights['bigram']
-        
+        new_pairs = unassigned_count * (unassigned_count - 1) + 2 * len(assigned_items) * unassigned_count
+
         if self.scorer.use_bigram_weighting:
-            # Optimistic: all remaining pairs get max_pos_score * max_item_weight
-            # Number of new pairs: n_unassigned*(n_unassigned-1) + 2*n_assigned*n_unassigned
-            new_pairs = unassigned_count * (unassigned_count - 1) + 2 * len(assigned_items) * unassigned_count
-            optimistic_score = new_pairs * max_pos_score * max_item_weight
-            optimistic_weight = new_pairs * max_item_weight
-            
+            # Tight bound: replace max_item_weight*new_pairs with the *actual* sum
+            # of item-pair weights for ordered pairs that are still to be formed.
+            # This is admissible because each remaining pair's position score is
+            # still bounded above by max_pos_score, while the per-pair item weight
+            # is exact rather than a global maximum.
+            items = self.scorer.items
+            ips = self.scorer.item_pair_scores
+
+            new_weight_sum = 0.0
+            for u in unassigned_idxs:
+                item_u = items[u]
+                for a in assigned_items:
+                    item_a = items[a]
+                    new_weight_sum += ips.get(item_u + item_a, 0.0)
+                    new_weight_sum += ips.get(item_a + item_u, 0.0)
+                for v in unassigned_idxs:
+                    if v != u:
+                        new_weight_sum += ips.get(item_u + items[v], 0.0)
+
+            optimistic_score = max_pos_score * new_weight_sum
+
             total_score = current_score + optimistic_score
-            total_weight = current_weight + optimistic_weight
-            
+            total_weight = current_weight + new_weight_sum
+
             upper_bound_raw = total_score / total_weight if total_weight > 0 else max_pos_score
         else:
             # Unweighted: optimistic average
-            new_pairs = unassigned_count * (unassigned_count - 1) + 2 * len(assigned_items) * unassigned_count
             current_pairs = len(assigned_items) * (len(assigned_items) - 1)
             total_pairs = current_pairs + new_pairs
             
