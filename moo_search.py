@@ -24,6 +24,7 @@ Usage:
 """
 
 import numpy as np
+import sys
 import time
 import gc
 from typing import List, Dict, Tuple, Optional
@@ -33,6 +34,10 @@ from tqdm import tqdm
 from dataclasses import dataclass
 
 from config import Config
+
+# Backtracking DFS recurses to depth == n_items_total.  Bump default 1000 limit
+# generously so realistic problem sizes never hit it.
+sys.setrecursionlimit(10000)
 
 
 @jit(nopython=True)
@@ -492,108 +497,99 @@ def branch_bound_moo_search(config: Config, scorer, max_solutions: Optional[int]
     stats = SearchStats()
     start_time = time.time()
     
-    def dfs_search_with_pruning(mapping: np.ndarray, used: np.ndarray, depth: int, pbar: Optional[tqdm]):
-        """Depth-first search with upper bound pruning."""
-        nonlocal pareto_front
-        
-        # Use iterative approach with explicit stack to handle large search spaces
-        stack = [(mapping.copy(), used.copy(), depth)]
-        
-        while stack:
-            current_mapping, current_used, current_depth = stack.pop()
-            stats.nodes_processed += 1
-            
-            # Check termination conditions
-            if time_limit and (time.time() - start_time) > time_limit:
-                if pbar:
-                    pbar.set_description(f"Time limit reached")
-                break
-            
-            if max_solutions and len(pareto_front) >= max_solutions:
-                if pbar:
-                    pbar.set_description(f"Solution limit reached")
-                break
-            
-            # Update progress
-            if pbar and stats.nodes_processed % 50000 == 0:
-                pbar.update(50000)
-                pbar.set_description(f"Pareto: {len(pareto_front)}, Pruned: {stats.nodes_pruned}")
-            
-            # Periodic cleanup
-            if stats.nodes_processed % 500000 == 0:
-                gc.collect()
-                bound_calc.clear_cache()
-                scorer.clear_cache()
-            
-            # Check if solution is complete
-            if current_depth == n_items_total:
-                # Validate constraints
-                if len(constrained_items) > 0:
-                    if not validate_constraints_jit(current_mapping, constrained_items, constrained_positions):
-                        continue
-                
-                # Evaluate solution
-                if hasattr(scorer, 'score_layout_fast'):
-                    objectives = scorer.score_layout_fast(current_mapping)
-                else:
-                    objectives = scorer.score_layout(current_mapping)
-                stats.solutions_found += 1
-                
-                # Create complete solution including pre-assignments
-                complete_mapping = {}
-                
-                # Add ALL items (preassigned + optimized)
-                for i in range(len(all_items)):
-                    item = all_items[i]
-                    pos = all_positions[current_mapping[i]]
-                    complete_mapping[item] = pos
-                
-                new_solution = {
-                    'mapping': complete_mapping,
-                    'objectives': objectives
-                }
-                
-                # Update Pareto front
-                pareto_front = update_pareto_front(pareto_front, new_solution)
-                
-                continue
-            
-            # CRITICAL: Multi-objective branch-and-bound pruning
-            if len(pareto_front) > 0:
-                
-                # Calculate upper bound vector for this partial solution
-                upper_bound_vector = bound_calc.calculate_upper_bound_vector(current_mapping, current_used)
+    # Backtracking DFS: mutate a single mapping/used buffer and undo on return.
+    # Avoids per-child np.copy() that previously dominated allocation cost.
+    constrained_set = set(int(x) for x in constrained_items)
+    terminate = [False]  # mutable flag for early termination across recursion
 
-                # Check if this branch can be pruned
-                can_prune = False
-                for pareto_solution in pareto_front:
-                    if pareto_dominates(pareto_solution['objectives'], upper_bound_vector):
-                        can_prune = True
-                        break
-                
-                if can_prune:
-                    stats.nodes_pruned += 1
-                    continue
-                            
-            # Get next item to assign
-            next_item = get_next_item_jit(current_mapping, constrained_items)
-            if next_item == -1:
-                continue
-            
-            # Get valid positions for this item
-            if next_item in constrained_items:
-                valid_positions = [pos for pos in constrained_positions if not current_used[pos]]
+    def dfs_search_with_pruning(mapping: np.ndarray, used: np.ndarray, depth: int, pbar: Optional[tqdm]):
+        """Depth-first search with upper bound pruning (recursive backtracking)."""
+        nonlocal pareto_front
+
+        if terminate[0]:
+            return
+        stats.nodes_processed += 1
+
+        # Check termination conditions
+        if time_limit and (time.time() - start_time) > time_limit:
+            if pbar:
+                pbar.set_description(f"Time limit reached")
+            terminate[0] = True
+            return
+
+        if max_solutions and len(pareto_front) >= max_solutions:
+            if pbar:
+                pbar.set_description(f"Solution limit reached")
+            terminate[0] = True
+            return
+
+        # Update progress
+        if pbar and stats.nodes_processed % 50000 == 0:
+            pbar.update(50000)
+            pbar.set_description(f"Pareto: {len(pareto_front)}, Pruned: {stats.nodes_pruned}")
+
+        # Periodic cleanup
+        if stats.nodes_processed % 500000 == 0:
+            gc.collect()
+            bound_calc.clear_cache()
+            scorer.clear_cache()
+
+        # Check if solution is complete
+        if depth == n_items_total:
+            # Validate constraints
+            if len(constrained_items) > 0:
+                if not validate_constraints_jit(mapping, constrained_items, constrained_positions):
+                    return
+
+            # Evaluate solution
+            if hasattr(scorer, 'score_layout_fast'):
+                objectives = scorer.score_layout_fast(mapping)
             else:
-                valid_positions = [pos for pos in range(n_positions_total) if not current_used[pos]]
-            
-            # Try each valid position (add to stack in reverse order for consistent ordering)
-            for pos in reversed(valid_positions):
-                new_mapping = current_mapping.copy()
-                new_used = current_used.copy()
-                new_mapping[next_item] = pos
-                new_used[pos] = True
-                
-                stack.append((new_mapping, new_used, current_depth + 1))
+                objectives = scorer.score_layout(mapping)
+            stats.solutions_found += 1
+
+            # Create complete solution including pre-assignments
+            complete_mapping = {}
+            for i in range(len(all_items)):
+                complete_mapping[all_items[i]] = all_positions[mapping[i]]
+
+            new_solution = {
+                'mapping': complete_mapping,
+                'objectives': objectives
+            }
+
+            # Update Pareto front
+            pareto_front = update_pareto_front(pareto_front, new_solution)
+            return
+
+        # CRITICAL: Multi-objective branch-and-bound pruning
+        if len(pareto_front) > 0:
+            upper_bound_vector = bound_calc.calculate_upper_bound_vector(mapping, used)
+            for pareto_solution in pareto_front:
+                if pareto_dominates(pareto_solution['objectives'], upper_bound_vector):
+                    stats.nodes_pruned += 1
+                    return
+
+        # Get next item to assign
+        next_item = get_next_item_jit(mapping, constrained_items)
+        if next_item == -1:
+            return
+
+        # Get valid positions for this item
+        if int(next_item) in constrained_set:
+            valid_positions = [pos for pos in constrained_positions if not used[pos]]
+        else:
+            valid_positions = [pos for pos in range(n_positions_total) if not used[pos]]
+
+        # Try each valid position with mutate-then-undo
+        for pos in valid_positions:
+            mapping[next_item] = pos
+            used[pos] = True
+            dfs_search_with_pruning(mapping, used, depth + 1, pbar)
+            mapping[next_item] = -1
+            used[pos] = False
+            if terminate[0]:
+                return
     
     # Run search with optional progress bar
     pbar = None
@@ -730,90 +726,86 @@ def exhaustive_moo_search(config: Config, scorer, search_mode: str, max_solution
     stats = SearchStats()
     start_time = time.time()
     
+    # Backtracking DFS: mutate a single mapping/used buffer and undo on return.
+    constrained_set = set(int(x) for x in constrained_items)
+    terminate = [False]
+
     def dfs_search_exhaustive(mapping: np.ndarray, used: np.ndarray, depth: int, pbar: Optional[tqdm]):
-        """Depth-first exhaustive search without pruning."""
+        """Depth-first exhaustive search without pruning (recursive backtracking)."""
         nonlocal pareto_front
-        
-        # Use iterative approach with explicit stack to handle large search spaces
-        stack = [(mapping.copy(), used.copy(), depth)]
-        
-        while stack:
-            current_mapping, current_used, current_depth = stack.pop()
-            stats.nodes_processed += 1
-            
-            # Check termination conditions
-            if time_limit and (time.time() - start_time) > time_limit:
-                if pbar:
-                    pbar.set_description(f"Time limit reached")
-                break
-            
-            if max_solutions and len(pareto_front) >= max_solutions:
-                if pbar:
-                    pbar.set_description(f"Solution limit reached")
-                break
-            
-            # Update progress
-            if pbar and stats.nodes_processed % 50000 == 0:
-                pbar.update(50000)
-                pbar.set_description(f"Pareto front: {len(pareto_front)}")
-            
-            # Periodic cleanup
-            if stats.nodes_processed % 500000 == 0:
-                gc.collect()
-                scorer.clear_cache()
-            
-            # Check if solution is complete
-            if current_depth == n_items_total:
-                # Validate constraints
-                if len(constrained_items) > 0:
-                    if not validate_constraints_jit(current_mapping, constrained_items, constrained_positions):
-                        continue
-                
-                # Evaluate solution
-                if hasattr(scorer, 'score_layout_fast'):
-                    objectives = scorer.score_layout_fast(current_mapping)
-                else:
-                    objectives = scorer.score_layout(current_mapping)
-                stats.solutions_found += 1
-                
-                # Create complete solution including pre-assignments
-                complete_mapping = {}
-                
-                # Add ALL items (preassigned + optimized)
-                for i in range(len(all_items)):
-                    item = all_items[i]
-                    pos = all_positions[current_mapping[i]]
-                    complete_mapping[item] = pos
-                
-                new_solution = {
-                    'mapping': complete_mapping,
-                    'objectives': objectives
-                }
-                
-                # Update Pareto front
-                pareto_front = update_pareto_front(pareto_front, new_solution)
-                
-                continue
-            
-            # Get next item to assign
-            next_item = get_next_item_jit(current_mapping, constrained_items)
-            if next_item == -1:
-                continue
-            
-            # Get valid positions for this item
-            if next_item in constrained_items:
-                valid_positions = [pos for pos in constrained_positions if not current_used[pos]]
+
+        if terminate[0]:
+            return
+        stats.nodes_processed += 1
+
+        # Check termination conditions
+        if time_limit and (time.time() - start_time) > time_limit:
+            if pbar:
+                pbar.set_description(f"Time limit reached")
+            terminate[0] = True
+            return
+
+        if max_solutions and len(pareto_front) >= max_solutions:
+            if pbar:
+                pbar.set_description(f"Solution limit reached")
+            terminate[0] = True
+            return
+
+        # Update progress
+        if pbar and stats.nodes_processed % 50000 == 0:
+            pbar.update(50000)
+            pbar.set_description(f"Pareto front: {len(pareto_front)}")
+
+        # Periodic cleanup
+        if stats.nodes_processed % 500000 == 0:
+            gc.collect()
+            scorer.clear_cache()
+
+        # Check if solution is complete
+        if depth == n_items_total:
+            # Validate constraints
+            if len(constrained_items) > 0:
+                if not validate_constraints_jit(mapping, constrained_items, constrained_positions):
+                    return
+
+            # Evaluate solution
+            if hasattr(scorer, 'score_layout_fast'):
+                objectives = scorer.score_layout_fast(mapping)
             else:
-                valid_positions = [pos for pos in range(n_positions_total) if not current_used[pos]]
-            
-            # Try each valid position (add to stack in reverse order for consistent ordering)
-            for pos in reversed(valid_positions):
-                new_mapping = current_mapping.copy()
-                new_used = current_used.copy()
-                new_mapping[next_item] = pos
-                new_used[pos] = True
-                
-                stack.append((new_mapping, new_used, current_depth + 1))
+                objectives = scorer.score_layout(mapping)
+            stats.solutions_found += 1
+
+            complete_mapping = {}
+            for i in range(len(all_items)):
+                complete_mapping[all_items[i]] = all_positions[mapping[i]]
+
+            new_solution = {
+                'mapping': complete_mapping,
+                'objectives': objectives
+            }
+
+            pareto_front = update_pareto_front(pareto_front, new_solution)
+            return
+
+        # Get next item to assign
+        next_item = get_next_item_jit(mapping, constrained_items)
+        if next_item == -1:
+            return
+
+        # Get valid positions for this item
+        if int(next_item) in constrained_set:
+            valid_positions = [pos for pos in constrained_positions if not used[pos]]
+        else:
+            valid_positions = [pos for pos in range(n_positions_total) if not used[pos]]
+
+        for pos in valid_positions:
+            mapping[next_item] = pos
+            used[pos] = True
+            dfs_search_exhaustive(mapping, used, depth + 1, pbar)
+            mapping[next_item] = -1
+            used[pos] = False
+            if terminate[0]:
+                return
     
     # Run search with optional progress bar
     pbar = None
