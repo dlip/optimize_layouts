@@ -562,6 +562,40 @@ def branch_bound_moo_search(config: Config, scorer, max_solutions: Optional[int]
         is_constrained_item[ci] = True
     terminate = [False]  # mutable flag for early termination across recursion
 
+    # Variable ordering: rank items by total bigram-pair weight (item interacts a
+    # lot with the rest -> assign earlier). Locking high-impact items first lets
+    # bounds and the Pareto front diverge quickly. Constrained items still go
+    # first (handled below) to keep constraint logic intact.
+    if scorer.use_bigram_weighting and scorer.item_pair_scores:
+        item_priority = np.zeros(n_items_total, dtype=np.float64)
+        for i in range(n_items_total):
+            item_i = scorer.items[i]
+            s = 0.0
+            for j in range(n_items_total):
+                if i == j:
+                    continue
+                item_j = scorer.items[j]
+                s += scorer.item_pair_scores.get(item_i + item_j, 0.0)
+                s += scorer.item_pair_scores.get(item_j + item_i, 0.0)
+            item_priority[i] = s
+        # Order: highest priority first, ties by original index.
+        item_order_unconstrained = sorted(
+            range(n_items_total), key=lambda i: (-item_priority[i], i)
+        )
+    else:
+        item_order_unconstrained = list(range(n_items_total))
+
+    def _next_item_priority(mapping: np.ndarray) -> int:
+        # Constrained items first (preserves prior get_next_item_jit semantics).
+        for ci in constrained_items:
+            if mapping[ci] < 0:
+                return int(ci)
+        # Then unconstrained items in priority order.
+        for i in item_order_unconstrained:
+            if mapping[i] < 0:
+                return i
+        return -1
+
     # Best-first ordering helper: pick the first bigram objective (if any) and use
     # it to estimate marginal score for each candidate (item, pos) pair given the
     # currently-assigned items. Trying high-promise children first surfaces good
@@ -663,8 +697,8 @@ def branch_bound_moo_search(config: Config, scorer, max_solutions: Optional[int]
                     stats.nodes_pruned += 1
                     return
 
-        # Get next item to assign
-        next_item = get_next_item_jit(mapping, constrained_items)
+        # Get next item to assign (priority order: constrained, then by impact)
+        next_item = _next_item_priority(mapping)
         if next_item == -1:
             return
 
