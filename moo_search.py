@@ -562,6 +562,39 @@ def branch_bound_moo_search(config: Config, scorer, max_solutions: Optional[int]
         is_constrained_item[ci] = True
     terminate = [False]  # mutable flag for early termination across recursion
 
+    # Best-first ordering helper: pick the first bigram objective (if any) and use
+    # it to estimate marginal score for each candidate (item, pos) pair given the
+    # currently-assigned items. Trying high-promise children first surfaces good
+    # Pareto solutions early -> tighter front -> more pruning.
+    primary_obj = None
+    for obj in scorer.objectives:
+        if obj not in scorer.trigram_objectives:
+            primary_obj = obj
+            break
+    primary_pos_scores = scorer.position_pair_scores.get(primary_obj, {}) if primary_obj else {}
+    primary_item_scores = scorer.item_pair_scores if scorer.use_bigram_weighting else None
+
+    def _marginal_estimate(item_idx: int, pos_idx: int, mapping: np.ndarray) -> float:
+        if not primary_pos_scores:
+            return 0.0
+        item = scorer.items[item_idx]
+        pos = scorer.positions[pos_idx]
+        total = 0.0
+        for a in range(n_items_total):
+            pa_idx = mapping[a]
+            if pa_idx < 0 or a == item_idx:
+                continue
+            pa = scorer.positions[pa_idx]
+            ia = scorer.items[a]
+            s_fwd = primary_pos_scores.get(pos + pa, 0.0)
+            s_bwd = primary_pos_scores.get(pa + pos, 0.0)
+            if primary_item_scores is not None:
+                total += s_fwd * primary_item_scores.get(item + ia, 0.0)
+                total += s_bwd * primary_item_scores.get(ia + item, 0.0)
+            else:
+                total += s_fwd + s_bwd
+        return total
+
     def dfs_search_with_pruning(mapping: np.ndarray, used: np.ndarray, depth: int, pbar: Optional[tqdm]):
         """Depth-first search with upper bound pruning (recursive backtracking)."""
         nonlocal pareto_front
@@ -640,6 +673,15 @@ def branch_bound_moo_search(config: Config, scorer, max_solutions: Optional[int]
             valid_positions = [pos for pos in constrained_positions if not used[pos]]
         else:
             valid_positions = [pos for pos in range(n_positions_total) if not used[pos]]
+
+        # Best-first ordering: try positions with highest estimated marginal
+        # score for the primary bigram objective first. Higher-quality solutions
+        # get into the Pareto front earlier, tightening subsequent pruning.
+        if len(valid_positions) > 1 and primary_pos_scores:
+            valid_positions.sort(
+                key=lambda p: _marginal_estimate(next_item, p, mapping),
+                reverse=True,
+            )
 
         # Try each valid position with mutate-then-undo
         for pos in valid_positions:
