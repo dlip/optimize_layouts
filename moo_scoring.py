@@ -271,29 +271,57 @@ class WeightedMOOScorer:
         Returns:
             List of objective scores, optionally with combined average appended
         """
+        # Build placed_items / placed_positions ONCE and reuse for every
+        # objective; previously each per-objective method rebuilt this list.
+        placed_items: List[str] = []
+        placed_positions: List[str] = []
+        for i, pos_idx in enumerate(mapping):
+            if pos_idx >= 0:
+                placed_items.append(self.items[i])
+                placed_positions.append(self.positions[pos_idx])
+
+        n_placed = len(placed_items)
+
         scores = []
-        
         for i, obj in enumerate(self.objectives):
             if obj in self.trigram_objectives:
-                score = self._score_single_trigram_objective(mapping, obj)
+                if n_placed < 3:
+                    score = 0.0
+                else:
+                    pos_table = self.position_triple_scores[obj]
+                    if self.use_trigram_weighting:
+                        score = self._calculate_trigram_weighted_score(
+                            placed_items, placed_positions, pos_table)
+                    else:
+                        score = self._calculate_trigram_unweighted_score(
+                            placed_items, placed_positions, pos_table)
             else:
-                score = self._score_single_bigram_objective(mapping, obj)
-            
+                if n_placed < 2:
+                    score = 0.0
+                else:
+                    pos_table = self.position_pair_scores[obj]
+                    if self.use_bigram_weighting:
+                        score = self._calculate_bigram_weighted_score(
+                            placed_items, placed_positions, pos_table)
+                    else:
+                        score = self._calculate_bigram_unweighted_score(
+                            placed_items, placed_positions, pos_table)
+
             # Apply weights and direction transformations
             weighted_score = score * self.objective_weights[i]
             if not self.objective_maximize[i]:
                 weighted_score = 1.0 - weighted_score
-            
+
             scores.append(weighted_score)
-        
+
         if return_components:
             combined_average = sum(scores) / len(scores) if scores else 0.0
             return scores + [combined_average]
         else:
             return scores
-    
+
     def _score_single_bigram_objective(self, mapping: np.ndarray, objective: str) -> float:
-        """Score layout for single bigram objective."""
+        """Score layout for single bigram objective (kept for external callers)."""
         position_pair_scores = self.position_pair_scores[objective]
         
         # Get currently placed items and their positions
@@ -317,7 +345,7 @@ class WeightedMOOScorer:
                 placed_items, placed_positions, position_pair_scores)
 
     def _score_single_trigram_objective(self, mapping: np.ndarray, objective: str) -> float:
-        """Score layout for single trigram objective."""
+        """Score layout for single trigram objective (kept for external callers)."""
         position_triple_scores = self.position_triple_scores[objective]
         
         # Get currently placed items and their positions
