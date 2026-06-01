@@ -24,6 +24,7 @@ Usage:
 """
 
 import numpy as np
+import os
 import sys
 import time
 import gc
@@ -38,6 +39,13 @@ from config import Config
 # Backtracking DFS recurses to depth == n_items_total.  Bump default 1000 limit
 # generously so realistic problem sizes never hit it.
 sys.setrecursionlimit(10000)
+
+# Set OPTIMIZE_LAYOUTS_DEBUG_BOUNDS=1 to assert that every computed upper bound
+# is actually >= the score of every completed solution that descends from the
+# corresponding partial mapping. Turns admissibility violations into loud
+# failures instead of silently lost Pareto solutions. Off by default; the check
+# is O(n) per leaf when on.
+DEBUG_BOUNDS = os.environ.get("OPTIMIZE_LAYOUTS_DEBUG_BOUNDS", "0") == "1"
 
 
 @jit(nopython=True)
@@ -561,6 +569,10 @@ def branch_bound_moo_search(config: Config, scorer, max_solutions: Optional[int]
     for ci in constrained_items:
         is_constrained_item[ci] = True
     terminate = [False]  # mutable flag for early termination across recursion
+    # Stack of bounds computed by ancestors of the current node. Only populated
+    # when DEBUG_BOUNDS is on; lets the leaf assert that every ancestor bound
+    # was admissible (>= the actual leaf score in every objective).
+    debug_bound_stack: List[List[float]] = []
 
     # Variable ordering: rank items by total bigram-pair weight (item interacts a
     # lot with the rest -> assign earlier). Locking high-impact items first lets
@@ -685,47 +697,71 @@ def branch_bound_moo_search(config: Config, scorer, max_solutions: Optional[int]
                 'objectives': objectives
             }
 
+            if DEBUG_BOUNDS and debug_bound_stack:
+                # Each recorded ancestor bound must be >= leaf score in every
+                # objective (admissibility). 1e-9 tolerance for float jitter.
+                for ancestor_bound in debug_bound_stack:
+                    for k, (b, s) in enumerate(zip(ancestor_bound, objectives)):
+                        if b + 1e-9 < s:
+                            raise AssertionError(
+                                f"Upper bound violation: ancestor bound[{k}]={b} "
+                                f"< leaf score[{k}]={s} for mapping {complete_mapping}"
+                            )
+
             # Update Pareto front
             pareto_front = update_pareto_front(pareto_front, new_solution)
             return
 
         # CRITICAL: Multi-objective branch-and-bound pruning
+        bound_pushed = False
         if len(pareto_front) > 0:
             upper_bound_vector = bound_calc.calculate_upper_bound_vector(mapping, used)
             for pareto_solution in pareto_front:
                 if pareto_dominates(pareto_solution['objectives'], upper_bound_vector):
                     stats.nodes_pruned += 1
                     return
-
-        # Get next item to assign (priority order: constrained, then by impact)
-        next_item = _next_item_priority(mapping)
-        if next_item == -1:
-            return
-
-        # Get valid positions for this item
-        if is_constrained_item[next_item]:
-            valid_positions = [pos for pos in constrained_positions if not used[pos]]
-        else:
-            valid_positions = [pos for pos in range(n_positions_total) if not used[pos]]
-
-        # Best-first ordering: try positions with highest estimated marginal
-        # score for the primary bigram objective first. Higher-quality solutions
-        # get into the Pareto front earlier, tightening subsequent pruning.
-        if len(valid_positions) > 1 and primary_pos_scores:
-            valid_positions.sort(
-                key=lambda p: _marginal_estimate(next_item, p, mapping),
-                reverse=True,
+            if DEBUG_BOUNDS:
+                debug_bound_stack.append(list(upper_bound_vector))
+                bound_pushed = True
+        elif DEBUG_BOUNDS:
+            debug_bound_stack.append(
+                list(bound_calc.calculate_upper_bound_vector(mapping, used))
             )
+            bound_pushed = True
 
-        # Try each valid position with mutate-then-undo
-        for pos in valid_positions:
-            mapping[next_item] = pos
-            used[pos] = True
-            dfs_search_with_pruning(mapping, used, depth + 1, pbar)
-            mapping[next_item] = -1
-            used[pos] = False
-            if terminate[0]:
+        try:
+            # Get next item to assign (priority order: constrained, then by impact)
+            next_item = _next_item_priority(mapping)
+            if next_item == -1:
                 return
+
+            # Get valid positions for this item
+            if is_constrained_item[next_item]:
+                valid_positions = [pos for pos in constrained_positions if not used[pos]]
+            else:
+                valid_positions = [pos for pos in range(n_positions_total) if not used[pos]]
+
+            # Best-first ordering: try positions with highest estimated marginal
+            # score for the primary bigram objective first. Higher-quality solutions
+            # get into the Pareto front earlier, tightening subsequent pruning.
+            if len(valid_positions) > 1 and primary_pos_scores:
+                valid_positions.sort(
+                    key=lambda p: _marginal_estimate(next_item, p, mapping),
+                    reverse=True,
+                )
+
+            # Try each valid position with mutate-then-undo
+            for pos in valid_positions:
+                mapping[next_item] = pos
+                used[pos] = True
+                dfs_search_with_pruning(mapping, used, depth + 1, pbar)
+                mapping[next_item] = -1
+                used[pos] = False
+                if terminate[0]:
+                    return
+        finally:
+            if bound_pushed:
+                debug_bound_stack.pop()
     
     # Run search with optional progress bar
     pbar = None
