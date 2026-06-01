@@ -167,6 +167,10 @@ class MOOUpperBoundCalculator:
     Trade-off: Bounds may be looser but algorithm correctness is preserved.
     """
     
+    # Hard cap on cached entries; upper bound calls happen once per internal
+    # node, so the dict was previously unbounded between the periodic clears.
+    _CACHE_MAX = 200_000
+
     def __init__(self, scorer):
         self.scorer = scorer
         self._cache = {}
@@ -213,9 +217,12 @@ class MOOUpperBoundCalculator:
         Formula: upper_bound = current_score + max_possible_remaining_score
         where max_possible_remaining_score is GUARANTEED achievable.
         """
-        cache_key = (tuple(partial_mapping), tuple(used_positions))
-        if cache_key in self._cache:
-            return self._cache[cache_key]
+        # `tobytes()` produces a hashable byte view directly off the contiguous
+        # ndarray buffer; far cheaper than tuple(partial_mapping).
+        cache_key = partial_mapping.tobytes() + b"|" + used_positions.tobytes()
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            return cached
         
         unassigned_count = sum(1 for x in partial_mapping if x < 0)
         
@@ -229,6 +236,10 @@ class MOOUpperBoundCalculator:
             # General case: conservative but mathematically sound bounds
             bound_vector = self._calculate_conservative_multi_item_bound(partial_mapping, unassigned_count)
         
+        # Bounded cache to keep memory predictable.  Drop a single arbitrary
+        # entry on overflow (cheap) rather than rebuilding an LRU on every hit.
+        if len(self._cache) >= self._CACHE_MAX:
+            self._cache.pop(next(iter(self._cache)))
         self._cache[cache_key] = bound_vector
         return bound_vector
     
