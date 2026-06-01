@@ -130,6 +130,82 @@ class WeightedMOOScorer:
             position_matrix=np.ones((n_positions, n_positions), dtype=np.float32)
         )
 
+        # Build vectorized score tables indexed by (item_idx, position_idx).
+        # The hot inner loop in _calculate_* methods previously rebuilt
+        # `items[i]+items[j]` strings and did dict lookups; with these arrays
+        # we can index directly off the integer mapping.
+        self._item_idx = {item: i for i, item in enumerate(self.items)}
+        self._pos_idx = {pos: i for i, pos in enumerate(self.positions)}
+        self._build_score_arrays()
+
+    def _build_score_arrays(self) -> None:
+        """Precompute numpy arrays for fast scoring inner loops.
+
+        After this runs:
+          - self.position_pair_arr[obj]   shape (n_pos, n_pos)  float64
+          - self.position_triple_arr[obj] shape (n_pos, n_pos, n_pos) float64
+          - self.position_pair_mask[obj]  shape (n_pos, n_pos)  bool
+          - self.position_triple_mask[obj] shape (n_pos, n_pos, n_pos) bool
+          - self.item_pair_arr            shape (n_items, n_items) float64
+          - self.item_triple_arr          shape (n_items, n_items, n_items) float64
+        Pairs/triples missing from the source tables remain 0.0 in the score
+        array and False in the mask.
+        """
+        n_items = len(self.items)
+        n_pos = len(self.positions)
+
+        # Position-pair tables
+        self.position_pair_arr: Dict[str, np.ndarray] = {}
+        self.position_pair_mask: Dict[str, np.ndarray] = {}
+        for obj, table in self.position_pair_scores.items():
+            arr = np.zeros((n_pos, n_pos), dtype=np.float64)
+            mask = np.zeros((n_pos, n_pos), dtype=bool)
+            for key, score in table.items():
+                p1 = self._pos_idx.get(key[0])
+                p2 = self._pos_idx.get(key[1])
+                if p1 is None or p2 is None:
+                    continue
+                arr[p1, p2] = score
+                mask[p1, p2] = True
+            self.position_pair_arr[obj] = arr
+            self.position_pair_mask[obj] = mask
+
+        # Position-triple tables
+        self.position_triple_arr: Dict[str, np.ndarray] = {}
+        self.position_triple_mask: Dict[str, np.ndarray] = {}
+        for obj, table in self.position_triple_scores.items():
+            arr = np.zeros((n_pos, n_pos, n_pos), dtype=np.float64)
+            mask = np.zeros((n_pos, n_pos, n_pos), dtype=bool)
+            for key, score in table.items():
+                p1 = self._pos_idx.get(key[0])
+                p2 = self._pos_idx.get(key[1])
+                p3 = self._pos_idx.get(key[2])
+                if p1 is None or p2 is None or p3 is None:
+                    continue
+                arr[p1, p2, p3] = score
+                mask[p1, p2, p3] = True
+            self.position_triple_arr[obj] = arr
+            self.position_triple_mask[obj] = mask
+
+        # Item-pair table
+        self.item_pair_arr = np.zeros((n_items, n_items), dtype=np.float64)
+        for key, score in self.item_pair_scores.items():
+            i = self._item_idx.get(key[0])
+            j = self._item_idx.get(key[1])
+            if i is None or j is None:
+                continue
+            self.item_pair_arr[i, j] = score
+
+        # Item-triple table
+        self.item_triple_arr = np.zeros((n_items, n_items, n_items), dtype=np.float64)
+        for key, score in self.item_triple_scores.items():
+            i = self._item_idx.get(key[0])
+            j = self._item_idx.get(key[1])
+            k = self._item_idx.get(key[2])
+            if i is None or j is None or k is None:
+                continue
+            self.item_triple_arr[i, j, k] = score
+
     def _load_position_pair_scores(self, position_pair_score_table: str) -> Dict[str, Dict[str, float]]:
         """Load position-pair scores for bigram objectives from CSV table."""
         if not Path(position_pair_score_table).exists():
@@ -267,47 +343,31 @@ class WeightedMOOScorer:
         Args:
             mapping: Array where mapping[i] = position_index for items[i] (-1 for unassigned)
             return_components: If True, return scores + combined average
-            
+
         Returns:
             List of objective scores, optionally with combined average appended
         """
-        # Build placed_items / placed_positions ONCE and reuse for every
-        # objective; previously each per-objective method rebuilt this list.
-        placed_items: List[str] = []
-        placed_positions: List[str] = []
-        for i, pos_idx in enumerate(mapping):
-            if pos_idx >= 0:
-                placed_items.append(self.items[i])
-                placed_positions.append(self.positions[pos_idx])
+        # Vectorized fast path using precomputed numpy score arrays.
+        placed_mask = mapping >= 0
+        placed_item_idx = np.flatnonzero(placed_mask)
+        placed_pos_idx = mapping[placed_item_idx].astype(np.intp, copy=False)
+        n_placed = placed_item_idx.size
 
-        n_placed = len(placed_items)
-
-        scores = []
+        scores: List[float] = []
         for i, obj in enumerate(self.objectives):
             if obj in self.trigram_objectives:
                 if n_placed < 3:
                     score = 0.0
                 else:
-                    pos_table = self.position_triple_scores[obj]
-                    if self.use_trigram_weighting:
-                        score = self._calculate_trigram_weighted_score(
-                            placed_items, placed_positions, pos_table)
-                    else:
-                        score = self._calculate_trigram_unweighted_score(
-                            placed_items, placed_positions, pos_table)
+                    score = self._score_trigram_vec(
+                        placed_item_idx, placed_pos_idx, obj)
             else:
                 if n_placed < 2:
                     score = 0.0
                 else:
-                    pos_table = self.position_pair_scores[obj]
-                    if self.use_bigram_weighting:
-                        score = self._calculate_bigram_weighted_score(
-                            placed_items, placed_positions, pos_table)
-                    else:
-                        score = self._calculate_bigram_unweighted_score(
-                            placed_items, placed_positions, pos_table)
+                    score = self._score_bigram_vec(
+                        placed_item_idx, placed_pos_idx, obj)
 
-            # Apply weights and direction transformations
             weighted_score = score * self.objective_weights[i]
             if not self.objective_maximize[i]:
                 weighted_score = 1.0 - weighted_score
@@ -319,6 +379,77 @@ class WeightedMOOScorer:
             return scores + [combined_average]
         else:
             return scores
+
+    def _score_bigram_vec(self, item_idx: np.ndarray, pos_idx: np.ndarray,
+                           objective: str) -> float:
+        """Vectorized bigram score using precomputed numpy arrays."""
+        pos_arr = self.position_pair_arr[objective]
+        pos_mask = self.position_pair_mask[objective]
+
+        # Outer-product-style index pairs (i, j) with i != j.
+        ii = item_idx[:, None]
+        jj = item_idx[None, :]
+        pi = pos_idx[:, None]
+        pj = pos_idx[None, :]
+
+        diag = np.eye(item_idx.size, dtype=bool)
+        valid = ~diag & pos_mask[pi, pj]
+
+        pos_scores = pos_arr[pi, pj]
+
+        if self.use_bigram_weighting:
+            item_w = self.item_pair_arr[ii, jj]
+            valid = valid & (item_w > 0.0)
+            if not np.any(valid):
+                return 0.0
+            weighted = (pos_scores * item_w)[valid]
+            weights = item_w[valid]
+            total_w = weights.sum()
+            return float(weighted.sum() / total_w) if total_w > 0 else 0.0
+        else:
+            if not np.any(valid):
+                return 0.0
+            sel = pos_scores[valid]
+            return float(sel.sum() / sel.size)
+
+    def _score_trigram_vec(self, item_idx: np.ndarray, pos_idx: np.ndarray,
+                            objective: str) -> float:
+        """Vectorized trigram score using precomputed numpy arrays."""
+        pos_arr = self.position_triple_arr[objective]
+        pos_mask = self.position_triple_mask[objective]
+
+        n = item_idx.size
+        ii = item_idx[:, None, None]
+        jj = item_idx[None, :, None]
+        kk = item_idx[None, None, :]
+        pi = pos_idx[:, None, None]
+        pj = pos_idx[None, :, None]
+        pk = pos_idx[None, None, :]
+
+        # Mask: all three indices distinct
+        idx_range = np.arange(n)
+        a = idx_range[:, None, None]
+        b = idx_range[None, :, None]
+        c = idx_range[None, None, :]
+        distinct = (a != b) & (b != c) & (a != c)
+        valid = distinct & pos_mask[pi, pj, pk]
+
+        pos_scores = pos_arr[pi, pj, pk]
+
+        if self.use_trigram_weighting:
+            item_w = self.item_triple_arr[ii, jj, kk]
+            valid = valid & (item_w > 0.0)
+            if not np.any(valid):
+                return 0.0
+            weighted = (pos_scores * item_w)[valid]
+            weights = item_w[valid]
+            total_w = weights.sum()
+            return float(weighted.sum() / total_w) if total_w > 0 else 0.0
+        else:
+            if not np.any(valid):
+                return 0.0
+            sel = pos_scores[valid]
+            return float(sel.sum() / sel.size)
 
     def _score_single_bigram_objective(self, mapping: np.ndarray, objective: str) -> float:
         """Score layout for single bigram objective (kept for external callers)."""
