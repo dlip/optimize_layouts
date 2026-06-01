@@ -120,6 +120,36 @@ def pareto_dominates(obj1: List[float], obj2: List[float]) -> bool:
     return at_least_one_better
 
 
+@jit(nopython=True, cache=True)
+def _dominates_arr(a: np.ndarray, b: np.ndarray) -> bool:
+    """JIT'd elementwise Pareto dominance check on float64 arrays."""
+    at_least_one_better = False
+    for i in range(a.shape[0]):
+        if a[i] < b[i]:
+            return False
+        if a[i] > b[i]:
+            at_least_one_better = True
+    return at_least_one_better
+
+
+@jit(nopython=True, cache=True)
+def _front_dominates_any(front: np.ndarray, n_rows: int, candidate: np.ndarray) -> bool:
+    """True if any of the first `n_rows` rows of `front` dominates `candidate`."""
+    for r in range(n_rows):
+        # inline dominance for tighter code
+        at_least_one_better = False
+        worse = False
+        for i in range(candidate.shape[0]):
+            if front[r, i] < candidate[i]:
+                worse = True
+                break
+            if front[r, i] > candidate[i]:
+                at_least_one_better = True
+        if not worse and at_least_one_better:
+            return True
+    return False
+
+
 def update_pareto_front(pareto_front: List[Dict], new_solution: Dict) -> List[Dict]:
     """
     Update Pareto front with a new solution.
@@ -132,21 +162,22 @@ def update_pareto_front(pareto_front: List[Dict], new_solution: Dict) -> List[Di
         Updated Pareto front
     """
     new_objectives = new_solution['objectives']
-    
+    new_arr = np.asarray(new_objectives, dtype=np.float64)
+
     # Check if new solution is dominated by any existing solution
     for existing in pareto_front:
-        if pareto_dominates(existing['objectives'], new_objectives):
+        if _dominates_arr(np.asarray(existing['objectives'], dtype=np.float64), new_arr):
             return pareto_front  # New solution is dominated
-    
+
     # Remove any existing solutions dominated by the new solution
     updated_front = []
     for existing in pareto_front:
-        if not pareto_dominates(new_objectives, existing['objectives']):
+        if not _dominates_arr(new_arr, np.asarray(existing['objectives'], dtype=np.float64)):
             updated_front.append(existing)
-    
+
     # Add the new solution
     updated_front.append(new_solution)
-    
+
     return updated_front
 
 
